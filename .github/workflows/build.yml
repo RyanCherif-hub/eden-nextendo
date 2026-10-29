@@ -1,0 +1,96 @@
+name: Build Eden Nextendo (Windows)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "patches/**"
+      - ".github/workflows/build.yml"
+
+env:
+  # Eden source (GitHub mirror) pinned to the commit the patches were written against.
+  EDEN_REPO: https://github.com/eden-emulator/mirror.git
+  EDEN_COMMIT: 26a03d2473787abf3223b2d0e65b291eee00c1e1
+  CI_REPO: https://github.com/Eden-CI/Workflow.git
+  DEVEL: "true"
+  BUILD_ID: nextendo
+  TARGET: amd64
+  COMPILER: gcc
+  ARCH: amd64-gcc-standard
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 340
+    steps:
+      - name: Checkout patches
+        uses: actions/checkout@v4
+
+      - name: Get Eden source and CI scripts
+        shell: bash
+        run: |
+          git init -q eden
+          cd eden
+          git remote add origin "$EDEN_REPO"
+          git fetch -q --depth 1 origin "$EDEN_COMMIT"
+          git checkout -q FETCH_HEAD
+          git clone -q --depth 1 "$CI_REPO" ../ci
+          rm -rf .ci
+          cp -r ../ci/.ci .ci
+
+      - name: Apply Nextendo patches
+        shell: bash
+        run: |
+          cd eden
+          git config user.name ci
+          git config user.email ci@localhost
+          for p in ../patches/*.patch; do
+            echo "Applying $p"
+            git am --3way "$p"
+          done
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git make autoconf libtool automake-wrapper patch jq
+            pactoys ninja
+          pacboy: >-
+            qt6-tools:p qt6-translations:p qt6-svg:p
+            7zip:p cmake:p toolchain:p clang:p python-pip:p lld:p
+            openssl:p boost:p fmt:p lz4:p nlohmann-json:p zlib:p zstd:p
+            vulkan-memory-allocator:p vulkan-devel:p glslang:p
+            enet:p opus:p mbedtls:p libusb:p unordered_dense:p
+            jbigkit:p xz:p libdeflate:p bzip2:p lerc:p graphite2:p crt-git:p
+            libwebp:p libtiff:p brotli:p
+
+      - name: Configure
+        shell: msys2 {0}
+        run: |
+          cd eden
+          ./.ci/build/configure.sh -DUSE_CCACHE=OFF -DENABLE_UPDATE_CHECKER=OFF
+
+      - name: Build
+        shell: msys2 {0}
+        run: |
+          cd eden
+          cmake --build build
+
+      - name: Package
+        shell: msys2 {0}
+        env:
+          MSYS_TOOLCHAIN: UCRT64
+          ARTIFACT_REF: nextendo
+        run: |
+          cd eden
+          ./.ci/package/windows.sh
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: Eden-Nextendo-Windows
+          path: eden/artifacts/*
+          retention-days: 30
