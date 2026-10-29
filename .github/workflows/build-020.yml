@@ -70,7 +70,7 @@ jobs:
             enet:p opus:p mbedtls:p libusb:p unordered_dense:p
             jbigkit:p xz:p libdeflate:p bzip2:p lerc:p graphite2:p crt-git:p
             libwebp:p libtiff:p brotli:p
-            ffmpeg:p qt6-base:p
+            ffmpeg:p qt6-base:p qt6-charts:p
 
       - name: Configure
         shell: msys2 {0}
