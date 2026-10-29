@@ -1,0 +1,162 @@
+From 455ee025e161c8ae834677ba659a3c5285b50929 Mon Sep 17 00:00:00 2001
+From: RyanCherif-hub <noreply@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 16:22:38 +0100
+Subject: [PATCH] Nextendo: working ssl:s contexts and Nextendo account id
+
+ssl:s CreateContext/CreateContextForSystem now return a real ISslContext
+(ACNH opens its HTTPS connections through it), CreateConnectionEx added,
+GetAccountId reports the linked Nextendo pid.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WPxeWxr692dY99HZxM8fWB
+---
+ src/core/hle/service/acc/acc.cpp            |  7 +++-
+ src/core/hle/service/acc/nextendo_token.cpp | 12 ++++++
+ src/core/hle/service/acc/nextendo_token.h   |  3 ++
+ src/core/hle/service/ssl/ssl.cpp            | 41 ++++++++++++++-------
+ 4 files changed, 48 insertions(+), 15 deletions(-)
+
+diff --git a/src/core/hle/service/acc/acc.cpp b/src/core/hle/service/acc/acc.cpp
+index cc0c3c7..2e099f4 100644
+--- a/src/core/hle/service/acc/acc.cpp
++++ b/src/core/hle/service/acc/acc.cpp
+@@ -714,11 +714,16 @@ private:
+     }
+ 
+     void GetAccountId(HLERequestContext& ctx) {
++        // Nextendo port: online services know the player by their Nextendo pid.
++        u64 account_id = Nextendo::GetLinkedPid();
++        if (account_id == 0) {
++            account_id = profile_manager->GetLastOpenedUser().Hash();
++        }
+         LOG_DEBUG(Service_ACC, "called");
+ 
+         IPC::ResponseBuilder rb{ctx, 4};
+         rb.Push(ResultSuccess);
+-        rb.PushRaw<u64>(profile_manager->GetLastOpenedUser().Hash());
++        rb.PushRaw<u64>(account_id);
+     }
+ 
+     void EnsureIdTokenCacheAsync(HLERequestContext& ctx) {
+diff --git a/src/core/hle/service/acc/nextendo_token.cpp b/src/core/hle/service/acc/nextendo_token.cpp
+index 9603366..c5b0844 100644
+--- a/src/core/hle/service/acc/nextendo_token.cpp
++++ b/src/core/hle/service/acc/nextendo_token.cpp
+@@ -310,6 +310,18 @@ std::vector<u8> GetIdTokenBytes(Core::System& system) {
+     return cached;
+ }
+ 
++u64 GetLinkedPid() {
++    static const u64 pid = [] {
++        const AccountInfo account = LoadAccount();
++        try {
++            return account.pid.empty() ? u64{0} : static_cast<u64>(std::stoull(account.pid));
++        } catch (...) {
++            return u64{0};
++        }
++    }();
++    return pid;
++}
++
+ void WriteIdToken(HLERequestContext& ctx, const std::vector<u8>& token) {
+     const std::size_t capacity = ctx.GetWriteBufferSize();
+     if (capacity == 0) {
+diff --git a/src/core/hle/service/acc/nextendo_token.h b/src/core/hle/service/acc/nextendo_token.h
+index e219521..c15818b 100644
+--- a/src/core/hle/service/acc/nextendo_token.h
++++ b/src/core/hle/service/acc/nextendo_token.h
+@@ -25,6 +25,9 @@ namespace Service::Account::Nextendo {
+ // Nextendo server checks.
+ std::vector<u8> GetIdTokenBytes(Core::System& system);
+ 
++// The linked Nextendo account id (pid), or 0 when no account file was found.
++u64 GetLinkedPid();
++
+ // Titles read the token as a C string: zero the rest of their buffer.
+ void WriteIdToken(HLERequestContext& ctx, const std::vector<u8>& token);
+ 
+diff --git a/src/core/hle/service/ssl/ssl.cpp b/src/core/hle/service/ssl/ssl.cpp
+index 999efd4..1d602ff 100644
+--- a/src/core/hle/service/ssl/ssl.cpp
++++ b/src/core/hle/service/ssl/ssl.cpp
+@@ -467,6 +467,7 @@ public:
+             {11, nullptr, "RemoveCrl"},
+             {12, nullptr, "ImportClientCertKeyPki"},
+             {13, nullptr, "GeneratePrivateKeyAndCert"},
++            {14, &ISslContext::CreateConnection, "CreateConnectionEx"},
+         };
+         RegisterHandlers(functions);
+     }
+@@ -636,7 +637,7 @@ class ISslServiceForSystem final : public ServiceFramework<ISslServiceForSystem>
+         explicit ISslServiceForSystem(Core::System& system_) : ServiceFramework{system_, "ssl:s"} {
+             // clang-format off
+             static const FunctionInfo functions[] = {
+-                {0, D<&ISslServiceForSystem::CreateContext>, "CreateContext"},
++                {0, &ISslServiceForSystem::CreateContext, "CreateContext"},
+                 {1, D<&ISslServiceForSystem::GetContextCount>, "GetContextCount"},
+                 {2, D<&ISslServiceForSystem::GetCertificates>, "GetCertificates"},
+                 {3, D<&ISslServiceForSystem::GetCertificateBufSize>, "GetCertificateBufSize"},
+@@ -646,7 +647,7 @@ class ISslServiceForSystem final : public ServiceFramework<ISslServiceForSystem>
+                 {7, D<&ISslServiceForSystem::SetDebugOption>, "SetDebugOption"},
+                 {8, D<&ISslServiceForSystem::GetDebugOption>, "GetDebugOption"},
+                 {9, D<&ISslServiceForSystem::ClearTls12FallbackFlag>, "ClearTls12FallbackFlag"},
+-                {100, D<&ISslServiceForSystem::CreateContextForSystem>, "CreateContextForSystem"},
++                {100, &ISslServiceForSystem::CreateContextForSystem, "CreateContextForSystem"},
+                 {101, D<&ISslServiceForSystem::SetThreadCoreMask>, "SetThreadCoreMask"},
+                 {102, D<&ISslServiceForSystem::GetThreadCoreMask>, "GetThreadCoreMask"},
+                 {103, D<&ISslServiceForSystem::VerifySignature>, "VerifySignature"}
+@@ -656,13 +657,29 @@ class ISslServiceForSystem final : public ServiceFramework<ISslServiceForSystem>
+             RegisterHandlers(functions);
+         };
+ 
+-        Result CreateContext() {
+-            LOG_DEBUG(Service_SSL, "(STUBBED) called.");
++        // Nextendo port (from citron-nextendo, GPL-3.0): ssl:s hands out a working context.
++        // Games such as Animal Crossing: New Horizons open their HTTPS connections through it.
++        void CreateContextImpl(HLERequestContext& ctx, const char* name) {
++            struct Parameters {
++                SslVersion ssl_version;
++                INSERT_PADDING_BYTES(0x4);
++                u64 pid_placeholder;
++            };
++            static_assert(sizeof(Parameters) == 0x10, "Parameters is an invalid size");
+ 
+-            // TODO (jarrodnorwell)
++            IPC::RequestParser rp{ctx};
++            const auto parameters = rp.PopRaw<Parameters>();
++            LOG_INFO(Service_SSL, "[Nextendo] ssl:s {} api_version={}", name,
++                     parameters.ssl_version.api_version);
+ 
+-            return ResultSuccess;
+-        };
++            IPC::ResponseBuilder rb{ctx, 2, 0, 1};
++            rb.Push(ResultSuccess);
++            rb.PushIpcInterface<ISslContext>(ctx, system, parameters.ssl_version);
++        }
++
++        void CreateContext(HLERequestContext& ctx) {
++            CreateContextImpl(ctx, "CreateContext");
++        }
+ 
+         Result GetContextCount() {
+             LOG_DEBUG(Service_SSL, "(STUBBED) called.");
+@@ -736,13 +753,9 @@ class ISslServiceForSystem final : public ServiceFramework<ISslServiceForSystem>
+             return ResultSuccess;
+         };
+ 
+-        Result CreateContextForSystem() {
+-            LOG_DEBUG(Service_SSL, "(STUBBED) called.");
+-
+-            // TODO (jarrodnorwell)
+-
+-            return ResultSuccess;
+-        };
++        void CreateContextForSystem(HLERequestContext& ctx) {
++            CreateContextImpl(ctx, "CreateContextForSystem");
++        }
+ 
+         Result SetThreadCoreMask() {
+             LOG_DEBUG(Service_SSL, "(STUBBED) called.");
+-- 
+2.43.0
+
