@@ -1,0 +1,685 @@
+From 88a5958fdf04724d26bbc4a4debc90bb2bdf40aa Mon Sep 17 00:00:00 2001
+From: RyanCherif-hub <noreply@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 15:00:54 +0100
+Subject: [PATCH] Nextendo online support (ported from citron-nextendo)
+
+NSD % substitution, DNS redirect to Nextendo servers, signed BAAS id_token
+reading the Citron-Nextendo account file, TLS verification bypass.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WPxeWxr692dY99HZxM8fWB
+---
+ src/core/CMakeLists.txt                       |   2 +
+ src/core/hle/service/acc/acc.cpp              |  30 +-
+ src/core/hle/service/acc/nextendo_token.cpp   | 323 ++++++++++++++++++
+ src/core/hle/service/acc/nextendo_token.h     |  31 ++
+ src/core/hle/service/sockets/nsd.cpp          |  20 +-
+ src/core/hle/service/sockets/sfdnsres.cpp     |  85 ++++-
+ .../hle/service/ssl/ssl_backend_openssl.cpp   |  17 +-
+ 7 files changed, 476 insertions(+), 32 deletions(-)
+ create mode 100644 src/core/hle/service/acc/nextendo_token.cpp
+ create mode 100644 src/core/hle/service/acc/nextendo_token.h
+
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 1b578f6..90c1750 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -395,6 +395,8 @@ add_library(core STATIC
+     hle/service/acc/async_context.cpp
+     hle/service/acc/async_context.h
+     hle/service/acc/errors.h
++    hle/service/acc/nextendo_token.cpp
++    hle/service/acc/nextendo_token.h
+     hle/service/acc/profile_manager.cpp
+     hle/service/acc/profile_manager.h
+     hle/service/am/am.cpp
+diff --git a/src/core/hle/service/acc/acc.cpp b/src/core/hle/service/acc/acc.cpp
+index d68b6bd..cc0c3c7 100644
+--- a/src/core/hle/service/acc/acc.cpp
++++ b/src/core/hle/service/acc/acc.cpp
+@@ -23,6 +23,7 @@
+ #include "core/hle/service/acc/acc.h"
+ #include "core/hle/service/acc/async_context.h"
+ #include "core/hle/service/acc/errors.h"
++#include "core/hle/service/acc/nextendo_token.h"
+ #include "core/hle/service/acc/profile_manager.h"
+ #include "core/hle/service/cmif_serialization.h"
+ #include "core/hle/service/glue/glue_manager.h"
+@@ -502,16 +503,13 @@ protected:
+     }
+ 
+     void LoadIdTokenCache(HLERequestContext& ctx) {
+-        LOG_WARNING(Service_ACC, "(STUBBED) called");
+-
+-        std::vector<u8> token_data(0x100);
+-        std::fill(token_data.begin(), token_data.end(), u8(0));
+-
+-        (void)ctx.WriteBuffer(token_data);
++        const std::vector<u8> token_bytes = Nextendo::GetIdTokenBytes(system);
++        LOG_INFO(Service_ACC, "[Nextendo] Providing BAAS ID token ({} bytes)", token_bytes.size());
++        Nextendo::WriteIdToken(ctx, token_bytes);
+ 
+         IPC::ResponseBuilder rb{ctx, 3};
+         rb.Push(ResultSuccess);
+-        rb.Push(static_cast<u32>(token_data.size()));
++        rb.Push<u32>(static_cast<u32>(token_bytes.size()));
+     }
+ 
+     void GetNintendoAccountUserResourceCacheForApplication(HLERequestContext& ctx) {
+@@ -661,11 +659,14 @@ public:
+     ~EnsureTokenIdCacheAsyncInterface() = default;
+ 
+     void LoadIdTokenCache(HLERequestContext& ctx) {
+-        LOG_WARNING(Service_ACC, "(STUBBED) called");
++        const std::vector<u8> token_bytes = Nextendo::GetIdTokenBytes(system);
++        LOG_INFO(Service_ACC, "[Nextendo] Providing BAAS ID token in async interface ({} bytes)",
++                 token_bytes.size());
++        Nextendo::WriteIdToken(ctx, token_bytes);
+ 
+         IPC::ResponseBuilder rb{ctx, 3};
+         rb.Push(ResultSuccess);
+-        rb.Push(0);
++        rb.Push<u32>(static_cast<u32>(token_bytes.size()));
+     }
+ 
+ protected:
+@@ -735,16 +736,13 @@ private:
+     }
+ 
+     void LoadIdTokenCache(HLERequestContext& ctx) {
+-        LOG_WARNING(Service_ACC, "(STUBBED) called");
+-
+-        std::vector<u8> token_data(0x100);
+-        std::fill(token_data.begin(), token_data.end(), u8(0));
+-
+-        ctx.WriteBuffer(token_data);
++        const std::vector<u8> token_bytes = Nextendo::GetIdTokenBytes(system);
++        LOG_INFO(Service_ACC, "[Nextendo] Providing BAAS ID token ({} bytes)", token_bytes.size());
++        Nextendo::WriteIdToken(ctx, token_bytes);
+ 
+         IPC::ResponseBuilder rb{ctx, 3};
+         rb.Push(ResultSuccess);
+-        rb.Push(static_cast<u32>(token_data.size()));
++        rb.Push<u32>(static_cast<u32>(token_bytes.size()));
+     }
+ 
+     void GetNintendoAccountUserResourceCacheForApplication(HLERequestContext& ctx) {
+diff --git a/src/core/hle/service/acc/nextendo_token.cpp b/src/core/hle/service/acc/nextendo_token.cpp
+new file mode 100644
+index 0000000..9603366
+--- /dev/null
++++ b/src/core/hle/service/acc/nextendo_token.cpp
+@@ -0,0 +1,323 @@
++// SPDX-FileCopyrightText: Copyright 2026 citron Emulator Project / Nextendo Network
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// Nextendo port for Eden. Logic taken from citron-nextendo (GPL-3.0).
++
++#include <algorithm>
++#include <chrono>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <span>
++#include <string>
++#include <string_view>
++#include <filesystem>
++#include <vector>
++
++#include <fmt/format.h>
++#include <openssl/bio.h>
++#include <openssl/evp.h>
++#include <openssl/pem.h>
++#include <openssl/rand.h>
++#include <openssl/rsa.h>
++
++#include "common/fs/file.h"
++#include "common/fs/fs.h"
++#include "common/fs/path_util.h"
++#include "common/hex_util.h"
++#include "common/logging.h"
++#include "common/string_util.h"
++#include "common/uuid.h"
++#include "core/core.h"
++#include "core/file_sys/control_metadata.h"
++#include "core/file_sys/patch_manager.h"
++#include "core/hle/service/acc/nextendo_token.h"
++#include "core/hle/service/hle_ipc.h"
++
++namespace Service::Account::Nextendo {
++
++namespace {
++
++constexpr const char* BaasIssuer = "https://e0d67c509fb203858ebcb2fe3f88c2aa.baas.nintendo.com";
++constexpr const char* BaasJku =
++    "https://e0d67c509fb203858ebcb2fe3f88c2aa.baas.nintendo.com/1.0.0/certificates";
++constexpr const char* BaasAudience = "ed9e2f05d286f7b8";
++constexpr const char* BaasKeyId = "nextendo-baas-key-1";
++
++// ---- Nextendo account (pid / token), same file format as citron-nextendo ----------------
++
++struct AccountInfo {
++    std::string pid;
++    std::string token;
++};
++
++void ParseAccountFile(const std::string& contents, AccountInfo& out) {
++    std::size_t start = 0;
++    while (start < contents.size()) {
++        std::size_t end = contents.find('\n', start);
++        if (end == std::string::npos) {
++            end = contents.size();
++        }
++        std::string line = contents.substr(start, end - start);
++        if (!line.empty() && line.back() == '\r') {
++            line.pop_back();
++        }
++        const auto eq = line.find('=');
++        if (eq != std::string::npos) {
++            const std::string key = line.substr(0, eq);
++            const std::string value = line.substr(eq + 1);
++            if (key == "pid") {
++                out.pid = value;
++            } else if (key == "token") {
++                out.token = value;
++            }
++        }
++        start = end + 1;
++    }
++}
++
++// Reads <eden config>/nextendo_account.txt, else Citron-Nextendo's own copy
++// (%APPDATA%/citron/config/nextendo_account.txt), so signing in once in Citron is enough.
++AccountInfo LoadAccount() {
++    AccountInfo info;
++    std::vector<std::filesystem::path> candidates;
++    candidates.push_back(Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) /
++                         "nextendo_account.txt");
++    candidates.push_back(Common::FS::GetLegacyPath(Common::FS::EmuPath::CitronConfigDir) /
++                         "nextendo_account.txt");
++#ifdef _WIN32
++    if (const char* appdata = std::getenv("APPDATA"); appdata && *appdata) {
++        candidates.push_back(std::filesystem::path{appdata} / "citron" / "config" /
++                             "nextendo_account.txt");
++    }
++#endif
++    for (const auto& path : candidates) {
++        const std::string contents =
++            Common::FS::ReadStringFromFile(path, Common::FS::FileType::TextFile);
++        if (contents.empty()) {
++            continue;
++        }
++        ParseAccountFile(contents, info);
++        if (!info.token.empty() || !info.pid.empty()) {
++            LOG_INFO(Service_ACC, "[Nextendo] Account loaded from {} (pid={}, token={})",
++                     path.string(), info.pid, info.token.empty() ? "missing" : "present");
++            return info;
++        }
++    }
++    LOG_WARNING(Service_ACC,
++                "[Nextendo] No nextendo_account.txt found; sign in once in Citron-Nextendo or "
++                "copy the file into Eden's config folder");
++    return info;
++}
++
++// ---- JWT helpers --------------------------------------------------------------------------
++
++std::string Base64UrlEncode(std::span<const u8> data) {
++    static constexpr std::string_view alphabet =
++        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
++    std::string out;
++    out.reserve((data.size() + 2) / 3 * 4);
++    for (std::size_t i = 0; i < data.size(); i += 3) {
++        const u32 remaining = static_cast<u32>(data.size() - i);
++        const u32 triple = (static_cast<u32>(data[i]) << 16) |
++                           (remaining > 1 ? static_cast<u32>(data[i + 1]) << 8 : 0) |
++                           (remaining > 2 ? static_cast<u32>(data[i + 2]) : 0);
++        out += alphabet[(triple >> 18) & 0x3F];
++        out += alphabet[(triple >> 12) & 0x3F];
++        if (remaining > 1) {
++            out += alphabet[(triple >> 6) & 0x3F];
++        }
++        if (remaining > 2) {
++            out += alphabet[triple & 0x3F];
++        }
++    }
++    return out;
++}
++
++std::string Base64UrlEncode(std::string_view text) {
++    return Base64UrlEncode(std::span{reinterpret_cast<const u8*>(text.data()), text.size()});
++}
++
++std::string RandomHex(std::size_t bytes) {
++    std::vector<u8> buffer(bytes);
++    if (RAND_bytes(buffer.data(), static_cast<int>(buffer.size())) != 1) {
++        for (auto& b : buffer) {
++            b = static_cast<u8>(std::rand());
++        }
++    }
++    return Common::HexToString(buffer, /*upper=*/false);
++}
++
++EVP_PKEY* LoadPem(const std::string& pem) {
++    BIO* bio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
++    if (!bio) {
++        return nullptr;
++    }
++    EVP_PKEY* key = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr);
++    BIO_free(bio);
++    return key;
++}
++
++EVP_PKEY* GenerateRsaKey() {
++    EVP_PKEY_CTX* kctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr);
++    if (!kctx) {
++        return nullptr;
++    }
++    EVP_PKEY* key = nullptr;
++    if (EVP_PKEY_keygen_init(kctx) <= 0 || EVP_PKEY_CTX_set_rsa_keygen_bits(kctx, 2048) <= 0 ||
++        EVP_PKEY_keygen(kctx, &key) <= 0) {
++        key = nullptr;
++    }
++    EVP_PKEY_CTX_free(kctx);
++    return key;
++}
++
++// A key that stays the same across launches (persisted in Eden's keys folder).
++EVP_PKEY* GetSigningKey() {
++    static EVP_PKEY* key = []() -> EVP_PKEY* {
++        if (const char* env = std::getenv("NEXTENDO_BAAS_SIGNING_KEY"); env && *env) {
++            if (EVP_PKEY* k = LoadPem(env)) {
++                return k;
++            }
++        }
++        const auto path =
++            Common::FS::GetEdenPath(Common::FS::EdenPath::KeysDir) / "nextendo_baas_auto.pem";
++        const std::string existing =
++            Common::FS::ReadStringFromFile(path, Common::FS::FileType::TextFile);
++        if (existing.find("BEGIN") != std::string::npos) {
++            if (EVP_PKEY* k = LoadPem(existing)) {
++                return k;
++            }
++        }
++        EVP_PKEY* generated = GenerateRsaKey();
++        if (!generated) {
++            LOG_ERROR(Service_ACC, "[Nextendo] Failed to generate a BAAS signing key");
++            return nullptr;
++        }
++        BIO* out = BIO_new(BIO_s_mem());
++        if (out && PEM_write_bio_PrivateKey(out, generated, nullptr, nullptr, 0, nullptr,
++                                            nullptr)) {
++            char* data = nullptr;
++            const long len = BIO_get_mem_data(out, &data);
++            if (len > 0 && data) {
++                void(Common::FS::CreateParentDirs(path));
++                void(Common::FS::WriteStringToFile(path, Common::FS::FileType::TextFile,
++                                                   std::string_view{data, std::size_t(len)}));
++            }
++        }
++        if (out) {
++            BIO_free(out);
++        }
++        return generated;
++    }();
++    return key;
++}
++
++std::string SignRs256(std::string_view input) {
++    EVP_PKEY* key = GetSigningKey();
++    if (!key) {
++        return {};
++    }
++    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
++    if (!ctx) {
++        return {};
++    }
++    std::string signature;
++    std::size_t length = 0;
++    const auto* data = reinterpret_cast<const unsigned char*>(input.data());
++    if (EVP_DigestSignInit(ctx, nullptr, EVP_sha256(), nullptr, key) == 1 &&
++        EVP_DigestSign(ctx, nullptr, &length, data, input.size()) == 1) {
++        std::vector<u8> raw(length);
++        if (EVP_DigestSign(ctx, raw.data(), &length, data, input.size()) == 1) {
++            raw.resize(length);
++            signature = Base64UrlEncode(raw);
++        }
++    }
++    EVP_MD_CTX_free(ctx);
++    if (signature.empty()) {
++        LOG_ERROR(Service_ACC, "[Nextendo] Failed to sign the BAAS id_token");
++    }
++    return signature;
++}
++
++std::string GetInstalledTitleVersion(Core::System& system, u64 program_id) {
++    if (program_id == 0) {
++        return {};
++    }
++    const FileSys::PatchManager pm{program_id, system.GetFileSystemController(),
++                                   system.GetContentProvider()};
++    const auto metadata = pm.GetControlMetadata();
++    return metadata.first != nullptr ? metadata.first->GetVersionString() : std::string{};
++}
++
++std::string BuildIdToken(const AccountInfo& account, const std::string& installed_version) {
++    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
++                         std::chrono::system_clock::now().time_since_epoch())
++                         .count();
++
++    const std::string header = fmt::format(
++        R"({{"alg":"RS256","kid":"{}","typ":"id_token","jku":"{}"}})", BaasKeyId, BaasJku);
++
++    std::string nnex_claim;
++    if (!account.token.empty()) {
++        nnex_claim = fmt::format(R"("nnex":"{}",)", account.token);
++    } else if (!account.pid.empty()) {
++        nnex_claim = fmt::format(R"("npid":"{}",)", account.pid);
++    }
++
++    const std::string device_id = RandomHex(0x10);
++    const std::string nintendo_claim = fmt::format(
++        R"("nintendo":{{"dt":"NX Prod 1","pc":"HAC","di":"{}","sn":"XAW10000000000","ist":false}},)",
++        device_id);
++
++    std::string tv_claim;
++    if (!installed_version.empty()) {
++        tv_claim = fmt::format(R"("tv":"{}",)", installed_version);
++    }
++
++    const std::string payload = fmt::format(
++        R"({{"sub":"{}","aud":"{}","iss":"{}","typ":"id_token","iat":{},"exp":{},"jku":"{}",)"
++        R"("jti":"{}","di":"{}","sn":"XAW10000000000","bs:did":"{}",{}{}{}"hm":true}})",
++        RandomHex(0x10), BaasAudience, BaasIssuer, now, now + 3 * 60 * 60, BaasJku,
++        Common::UUID::MakeRandom().FormattedString(), device_id, RandomHex(0x10),
++        nintendo_claim, nnex_claim, tv_claim);
++
++    const std::string signing_input = Base64UrlEncode(header) + "." + Base64UrlEncode(payload);
++    return signing_input + "." + SignRs256(signing_input);
++}
++
++} // Anonymous namespace
++
++std::vector<u8> GetIdTokenBytes(Core::System& system) {
++    static std::mutex mutex;
++    static std::vector<u8> cached;
++    static std::chrono::steady_clock::time_point expiry{};
++    static u64 cached_program_id = 0;
++
++    std::lock_guard lock{mutex};
++    const u64 program_id = system.GetApplicationProcessProgramID();
++    const auto now = std::chrono::steady_clock::now();
++    if (cached.empty() || now >= expiry || program_id != cached_program_id) {
++        const AccountInfo account = LoadAccount();
++        const std::string token =
++            BuildIdToken(account, GetInstalledTitleVersion(system, program_id));
++        cached.assign(token.begin(), token.end());
++        expiry = now + std::chrono::hours{2};
++        cached_program_id = program_id;
++        LOG_INFO(Service_ACC, "[Nextendo] Issued a signed BAAS id_token ({} bytes)",
++                 cached.size());
++    }
++    return cached;
++}
++
++void WriteIdToken(HLERequestContext& ctx, const std::vector<u8>& token) {
++    const std::size_t capacity = ctx.GetWriteBufferSize();
++    if (capacity == 0) {
++        return;
++    }
++    std::vector<u8> out(capacity, 0);
++    std::memcpy(out.data(), token.data(), std::min(token.size(), capacity));
++    ctx.WriteBuffer(out);
++}
++
++} // namespace Service::Account::Nextendo
+diff --git a/src/core/hle/service/acc/nextendo_token.h b/src/core/hle/service/acc/nextendo_token.h
+new file mode 100644
+index 0000000..e219521
+--- /dev/null
++++ b/src/core/hle/service/acc/nextendo_token.h
+@@ -0,0 +1,31 @@
++// SPDX-FileCopyrightText: Copyright 2026 citron Emulator Project / Nextendo Network
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// Nextendo port for Eden. Logic taken from citron-nextendo (GPL-3.0):
++// src/core/hle/service/acc/acc.cpp and src/common/nextendo_account.cpp.
++
++#pragma once
++
++#include <vector>
++
++#include "common/common_types.h"
++
++namespace Core {
++class System;
++}
++
++namespace Service {
++class HLERequestContext;
++}
++
++namespace Service::Account::Nextendo {
++
++// Signed RS256 BAAS id_token the games read through LoadIdTokenCache. NEX parses it before
++// logging in. It carries the user's Nextendo account token in the "nnex" claim, which the
++// Nextendo server checks.
++std::vector<u8> GetIdTokenBytes(Core::System& system);
++
++// Titles read the token as a C string: zero the rest of their buffer.
++void WriteIdToken(HLERequestContext& ctx, const std::vector<u8>& token);
++
++} // namespace Service::Account::Nextendo
+diff --git a/src/core/hle/service/sockets/nsd.cpp b/src/core/hle/service/sockets/nsd.cpp
+index 241f297..2147a8d 100644
+--- a/src/core/hle/service/sockets/nsd.cpp
++++ b/src/core/hle/service/sockets/nsd.cpp
+@@ -64,11 +64,21 @@ NSD::NSD(Core::System& system_, const char* name) : ServiceFramework{system_, na
+ }
+ 
+ static std::string ResolveImpl(const std::string& fqdn_in) {
+-    // The real implementation makes various substitutions.
+-    // For now we just return the string as-is, which is good enough when not
+-    // connecting to real Nintendo servers.
+-    LOG_WARNING(Service, "(STUBBED) called, fqdn_in={}", fqdn_in);
+-    return fqdn_in;
++    // Nextendo port (from citron-nextendo, GPL-3.0): mirror the console's substitutions.
++    std::string fqdn = fqdn_in;
++    if (fqdn == "api.accounts.nintendo.com" || fqdn == "accounts.nintendo.com") {
++        fqdn = "e0d67c509fb203858ebcb2fe3f88c2aa.baas.nintendo.com";
++    } else if (fqdn == "e97b8a9d672e4ce4845ec6947cd66ef6-sb-api.accounts.nintendo.com" ||
++               fqdn == "e97b8a9d672e4ce4845ec6947cd66ef6-sb.accounts.nintendo.com") {
++        fqdn = "e97b8a9d672e4ce4845ec6947cd66ef6-sb.baas.nintendo.com";
++    } else {
++        const auto pos = fqdn.find('%');
++        if (pos != std::string::npos) {
++            fqdn.replace(pos, 1, "lp1");
++        }
++    }
++    LOG_INFO(Service, "[NSD] ResolveImpl: fqdn_in='{}' -> fqdn_out='{}'", fqdn_in, fqdn);
++    return fqdn;
+ }
+ 
+ static Result ResolveCommon(const std::string& fqdn_in, std::array<char, 0x100>& fqdn_out) {
+diff --git a/src/core/hle/service/sockets/sfdnsres.cpp b/src/core/hle/service/sockets/sfdnsres.cpp
+index 93c01bf..ff6bce0 100644
+--- a/src/core/hle/service/sockets/sfdnsres.cpp
++++ b/src/core/hle/service/sockets/sfdnsres.cpp
+@@ -4,6 +4,8 @@
+ // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <cstdlib>
++#include <optional>
+ #include <string_view>
+ #include <utility>
+ #include <vector>
+@@ -102,6 +104,63 @@ static bool IsBlockedHost(const std::string& host) {
+         [&host](const std::string& domain) { return host.find(domain) != std::string::npos; });
+ }
+ 
++// ---------------------------------------------------------------------------
++// Nextendo port (logic from citron-nextendo, GPL-3.0).
++// On by default in this build. Set NEXTENDO_ENABLE=0 to turn it off.
++// Override servers with NEXTENDO_SERVER_IP / NEXTENDO_NAT_IP.
++// ---------------------------------------------------------------------------
++static bool NextendoActive() {
++    const char* env = std::getenv("NEXTENDO_ENABLE");
++    if (env == nullptr || *env == '\0') {
++        return true;
++    }
++    const std::string v = Common::ToLower(env);
++    return v != "0" && v != "false" && v != "no" && v != "off";
++}
++
++static std::string NextendoIp(const char* env_var, const char* fallback) {
++    if (const char* env = std::getenv(env_var); env && *env) {
++        return env;
++    }
++    return fallback;
++}
++
++static void NextendoNormalizeHost(std::string& host) {
++    const auto pos = host.find('%');
++    if (pos != std::string::npos) {
++        host.replace(pos, 1, "lp1");
++    }
++    if (host == "api.accounts.nintendo.com" || host == "accounts.nintendo.com") {
++        host = "e0d67c509fb203858ebcb2fe3f88c2aa.baas.nintendo.com";
++    }
++}
++
++static std::optional<std::string> GetNextendoRedirectIp(const std::string& host) {
++    if (!NextendoActive()) {
++        return std::nullopt;
++    }
++    const std::string server_ip = NextendoIp("NEXTENDO_SERVER_IP", "51.178.29.194");
++    const std::string nat_ip = NextendoIp("NEXTENDO_NAT_IP", "164.132.111.120");
++
++    // System update host stays untouched (Prelude does the same).
++    if (host == "sun.hac.lp1.d4c.nintendo.net" || host.find(".d4c.nintendo.net") != std::string::npos) {
++        return std::nullopt;
++    }
++    // Pia needs a second, distinct address for its NAT check.
++    if (host.starts_with("nncs2-") && host.ends_with(".n.n.srv.nintendo.net")) {
++        LOG_INFO(Service, "[Nextendo] Redirecting NAT check host '{}' -> '{}'", host, nat_ip);
++        return nat_ip;
++    }
++    if (host == "nintendo.net" || host.ends_with(".nintendo.net") || host == "nintendo.com" ||
++        host.ends_with(".nintendo.com") || host == "nintendowifi.net" ||
++        host.ends_with(".nintendowifi.net") || host == "nintendo.co.jp" ||
++        host.ends_with(".nintendo.co.jp")) {
++        LOG_INFO(Service, "[Nextendo] Redirecting Nintendo host '{}' -> '{}'", host, server_ip);
++        return server_ip;
++    }
++    return std::nullopt;
++}
++
+ static NetDbError GetAddrInfoErrorToNetDbError(GetAddrInfoError result) {
+     // These combinations have been verified on console (but are not
+     // exhaustive).
+@@ -199,16 +258,20 @@ static std::pair<u32, GetAddrInfoError> GetHostByNameRequestImpl(HLERequestConte
+         parameters.use_nsd_resolve, parameters.cancel_handle, parameters.process_id);
+ 
+     const auto host_buffer = ctx.ReadBuffer(0);
+-    const std::string host = Common::StringFromBuffer(host_buffer);
++    std::string host = Common::StringFromBuffer(host_buffer);
+     // For now, ignore options, which are in input buffer 1 for GetHostByNameRequestWithOptions.
+ 
+-    // Prevent resolution of Nintendo servers
+-    if (IsBlockedHost(host)) {
++    NextendoNormalizeHost(host);
++    std::string query_host = host;
++    if (const auto redirect = GetNextendoRedirectIp(host)) {
++        query_host = *redirect;
++    } else if (IsBlockedHost(host)) {
++        // Prevent resolution of Nintendo servers
+         LOG_WARNING(Network, "Resolution of hostname {} requested, returning EAI_AGAIN", host);
+         return {0, GetAddrInfoError::AGAIN};
+     }
+ 
+-    auto res_v = Network::GetAddressInfo(host, /*service*/ std::nullopt);
++    auto res_v = Network::GetAddressInfo(query_host, /*service*/ std::nullopt);
+     if (auto* res = std::get_if<std::vector<Network::AddrInfo>>(&res_v)) {
+         const std::vector<u8> data = SerializeAddrInfoAsHostEnt(*res, host);
+         const u32 data_size = u32(data.size());
+@@ -316,10 +379,14 @@ static std::pair<u32, GetAddrInfoError> GetAddrInfoRequestImpl(HLERequestContext
+     // before looking up.
+ 
+     const auto host_buffer = ctx.ReadBuffer(0);
+-    const std::string host = Common::StringFromBuffer(host_buffer);
+-
+-    // Prevent resolution of Nintendo servers
+-    if (IsBlockedHost(host)) {
++    std::string host = Common::StringFromBuffer(host_buffer);
++
++    NextendoNormalizeHost(host);
++    std::string query_host = host;
++    if (const auto redirect = GetNextendoRedirectIp(host)) {
++        query_host = *redirect;
++    } else if (IsBlockedHost(host)) {
++        // Prevent resolution of Nintendo servers
+         LOG_WARNING(Network, "Resolution of hostname {} requested, returning EAI_AGAIN", host);
+         return {0, GetAddrInfoError::AGAIN};
+     }
+@@ -332,7 +399,7 @@ static std::pair<u32, GetAddrInfoError> GetAddrInfoRequestImpl(HLERequestContext
+ 
+     // Serialized hints are also passed in a buffer, but are ignored for now.
+ 
+-    auto res_v = Network::GetAddressInfo(host, service);
++    auto res_v = Network::GetAddressInfo(query_host, service);
+     if (auto* res = std::get_if<std::vector<Network::AddrInfo>>(&res_v)) {
+         const std::vector<u8> data = SerializeAddrInfo(*res, host);
+         const u32 data_size = u32(data.size());
+diff --git a/src/core/hle/service/ssl/ssl_backend_openssl.cpp b/src/core/hle/service/ssl/ssl_backend_openssl.cpp
+index 435ada8..fff5672 100644
+--- a/src/core/hle/service/ssl/ssl_backend_openssl.cpp
++++ b/src/core/hle/service/ssl/ssl_backend_openssl.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <cstdlib>
+ #include <mutex>
+ 
+ #include <openssl/bio.h>
+@@ -27,6 +28,18 @@ using namespace Common::FS;
+ 
+ namespace Service::SSL {
+ 
++// Nextendo port (from citron-nextendo, GPL-3.0): the redirected servers do not present
++// Nintendo-signed certificates, so verification is bypassed. Set NEXTENDO_ENABLE=0 to restore it.
++static bool NextendoTlsBypass() {
++    const char* env = std::getenv("NEXTENDO_ENABLE");
++    if (env == nullptr || *env == '\0') {
++        return true;
++    }
++    const std::string v{env};
++    return !(v == "0" || v == "false" || v == "no" || v == "off");
++}
++
++
+ // Import OpenSSL's `SSL` type into the namespace.  This is needed because the
+ // namespace is also named `SSL`.
+ using ::SSL;
+@@ -184,7 +197,7 @@ public:
+     }
+ 
+     void SetVerifyOption(u32 option) override {
+-        skip_cert_verification = (option == 0);
++        skip_cert_verification = (option == 0) || NextendoTlsBypass();
+         LOG_WARNING(Service_SSL, "option={} skip_verification={}", option,
+                     skip_cert_verification);
+         if (skip_cert_verification) {
+@@ -384,7 +397,7 @@ public:
+     SSL* ssl = nullptr;
+     BIO* bio = nullptr;
+     bool got_read_eof = false;
+-    bool skip_cert_verification = false;
++    bool skip_cert_verification = NextendoTlsBypass();
+ 
+     std::shared_ptr<Network::SocketBase> socket;
+ };
+-- 
+2.43.0
+
