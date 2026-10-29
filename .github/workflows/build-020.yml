@@ -1,0 +1,94 @@
+name: Build Eden 0.2.0 airport fix (Windows)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "patches-020/**"
+      - ".github/workflows/build-020.yml"
+
+env:
+  # Eden 0.2.0 release source and the CI scripts from the same week.
+  EDEN_REPO: https://github.com/eden-emulator/mirror.git
+  EDEN_TAG: v0.2.0
+  CI_REPO: https://github.com/Eden-CI/Workflow.git
+  CI_COMMIT: de2121b
+  DEVEL: "true"
+  BUILD_ID: fix020
+  TARGET: amd64
+  COMPILER: gcc
+  ARCH: amd64-gcc-standard
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 340
+    steps:
+      - name: Checkout patches
+        uses: actions/checkout@v4
+
+      - name: Get Eden 0.2.0 source and CI scripts
+        shell: bash
+        run: |
+          git clone -q --depth 1 --branch "$EDEN_TAG" "$EDEN_REPO" eden
+          git clone -q --shallow-since=2026-05-01 "$CI_REPO" ci
+          git -C ci checkout -q "$CI_COMMIT"
+          rm -rf eden/.ci
+          cp -r ci/.ci eden/.ci
+
+      - name: Apply fix
+        shell: bash
+        run: |
+          cd eden
+          git config user.name ci
+          git config user.email ci@localhost
+          for p in ../patches-020/*.patch; do
+            echo "Applying $p"
+            git am --3way "$p"
+          done
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git make autoconf libtool automake-wrapper patch jq
+            pactoys ninja
+          pacboy: >-
+            qt6-tools:p qt6-translations:p qt6-svg:p
+            7zip:p cmake:p toolchain:p clang:p python-pip:p lld:p
+            openssl:p boost:p fmt:p lz4:p nlohmann-json:p zlib:p zstd:p
+            vulkan-memory-allocator:p vulkan-devel:p glslang:p
+            enet:p opus:p mbedtls:p libusb:p unordered_dense:p
+            jbigkit:p xz:p libdeflate:p bzip2:p lerc:p graphite2:p crt-git:p
+            libwebp:p libtiff:p brotli:p
+
+      - name: Configure
+        shell: msys2 {0}
+        run: |
+          cd eden
+          ./.ci/common/configure.sh -DUSE_CCACHE=OFF -DENABLE_UPDATE_CHECKER=OFF
+
+      - name: Build
+        shell: msys2 {0}
+        run: |
+          cd eden
+          cmake --build build
+
+      - name: Package
+        shell: msys2 {0}
+        env:
+          MSYS_TOOLCHAIN: MINGW64
+          ARTIFACT_REF: v0.2.0-airportfix
+        run: |
+          cd eden
+          ./.ci/windows/package.sh
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: Eden-0.2.0-AirportFix-Windows
+          path: eden/artifacts/*
+          retention-days: 30
