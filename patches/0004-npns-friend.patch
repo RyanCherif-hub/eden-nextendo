@@ -1,0 +1,145 @@
+From 8ed67010aaf20d81002607b816062425d8f1c18d Mon Sep 17 00:00:00 2001
+From: RyanCherif-hub <noreply@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 18:43:05 +0100
+Subject: [PATCH] Nextendo: npns and friend calls ACNH makes online
+
+npns:u CreateToken/ListenToMyApplicationId/GetState and npns:s
+ListenToMyApplicationId were nullptr; ACNH panicked (2010-0212) right after
+its HTTPS login. Also stub friend DeclareOpenOnlinePlaySession,
+AddPlayHistory, GetPlayHistoryRegistrationKeyWithNetworkServiceAccountId and
+an empty GetFriendListIds (as in citron-nextendo).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WPxeWxr692dY99HZxM8fWB
+---
+ src/core/hle/service/friend/friend.cpp | 29 ++++++++++++++++++++----
+ src/core/hle/service/npns/npns.cpp     | 31 ++++++++++++++++++++++----
+ 2 files changed, 52 insertions(+), 8 deletions(-)
+
+diff --git a/src/core/hle/service/friend/friend.cpp b/src/core/hle/service/friend/friend.cpp
+index f8690db..2d33eca 100644
+--- a/src/core/hle/service/friend/friend.cpp
++++ b/src/core/hle/service/friend/friend.cpp
+@@ -26,7 +26,7 @@ public:
+         static const FunctionInfo functions[] = {
+             {0, &IFriendService::GetCompletionEvent, "GetCompletionEvent"},
+             {1, &IFriendService::Cancel, "Cancel"},
+-            {10100, nullptr, "GetFriendListIds"},
++            {10100, &IFriendService::GetFriendListIds, "GetFriendListIds"},
+             {10101, &IFriendService::GetFriendList, "GetFriendList"},
+             {10102, nullptr, "UpdateFriendInfo"},
+             {10110, nullptr, "GetFriendProfileImage"},
+@@ -40,12 +40,12 @@ public:
+             {10421, nullptr, "EnsureBlockedUserListAvailable"},
+             {10500, nullptr, "GetProfileList"},
+             {10501, nullptr, "GetProfileListV2"}, // 18.0.0+
+-            {10600, nullptr, "DeclareOpenOnlinePlaySession"},
++            {10600, &IFriendService::DeclareOpenOnlinePlaySession, "DeclareOpenOnlinePlaySession"},
+             {10601, &IFriendService::DeclareCloseOnlinePlaySession, "DeclareCloseOnlinePlaySession"},
+             {10610, &IFriendService::UpdateUserPresence, "UpdateUserPresence"},
+             {10700, &IFriendService::GetPlayHistoryRegistrationKey, "GetPlayHistoryRegistrationKey"},
+-            {10701, nullptr, "GetPlayHistoryRegistrationKeyWithNetworkServiceAccountId"},
+-            {10702, nullptr, "AddPlayHistory"},
++            {10701, &IFriendService::NextendoSuccessStub, "GetPlayHistoryRegistrationKeyWithNetworkServiceAccountId"},
++            {10702, &IFriendService::NextendoSuccessStub, "AddPlayHistory"},
+             {11000, nullptr, "GetProfileImageUrl"},
+             {11001, nullptr, "GetProfileImageUrlV2"}, // 18.0.0+
+             {20100, &IFriendService::GetFriendCount, "GetFriendCount"},
+@@ -243,6 +243,27 @@ private:
+         rb.Push(true);
+     }
+ 
++    // Nextendo port (from citron-nextendo, GPL-3.0): calls ACNH makes once it is online. They were
++    // nullptr, which makes the game panic. Success stubs; no friend list backend yet.
++    void DeclareOpenOnlinePlaySession(HLERequestContext& ctx) {
++        LOG_INFO(Service_Friend, "[Nextendo] DeclareOpenOnlinePlaySession called");
++        IPC::ResponseBuilder rb{ctx, 2};
++        rb.Push(ResultSuccess);
++    }
++
++    void NextendoSuccessStub(HLERequestContext& ctx) {
++        LOG_WARNING(Service_Friend, "(STUBBED) [Nextendo] called");
++        IPC::ResponseBuilder rb{ctx, 2};
++        rb.Push(ResultSuccess);
++    }
++
++    void GetFriendListIds(HLERequestContext& ctx) {
++        LOG_INFO(Service_Friend, "[Nextendo] GetFriendListIds -> 0");
++        IPC::ResponseBuilder rb{ctx, 3};
++        rb.Push(ResultSuccess);
++        rb.Push<u32>(0);
++    }
++
+     void DeclareCloseOnlinePlaySession(HLERequestContext& ctx) {
+         // Stub used by Splatoon 2
+         LOG_WARNING(Service_Friend, "(STUBBED) called");
+diff --git a/src/core/hle/service/npns/npns.cpp b/src/core/hle/service/npns/npns.cpp
+index b0f74be..d118618 100644
+--- a/src/core/hle/service/npns/npns.cpp
++++ b/src/core/hle/service/npns/npns.cpp
+@@ -41,7 +41,7 @@ public:
+             {23, nullptr, "DestroyToken"},
+             {24, nullptr, "DestroyTokenWithApplicationId"},
+             {25, nullptr, "QueryIsTokenValid"},
+-            {26, nullptr, "ListenToMyApplicationId"},
++            {26, C<&INpnsSystem::ListenToMyApplicationId>, "ListenToMyApplicationId"},
+             {27, nullptr, "DestroyTokenAll"},
+             {28, nullptr, "CreateTokenWithName"}, // 18.0.0+
+             {29, nullptr, "DestroyTokenWithName"}, // 18.0.0+
+@@ -123,6 +123,11 @@ private:
+         R_SUCCEED();
+     }
+ 
++    Result ListenToMyApplicationId() {
++        LOG_WARNING(Service_NPNS, "(STUBBED) called");
++        R_SUCCEED();
++    }
++
+     Result GetLastNotifiedTime(Out<s64> out_last_notified_time) {
+         LOG_WARNING(Service_NPNS, "(STUBBED) called");
+ 
+@@ -158,13 +163,13 @@ public:
+             {5, C<&INpnsUser::GetReceiveEvent>, "GetReceiveEvent"},
+             {7, nullptr, "GetStateChangeEvent"},
+             {8, C<&INpnsUser::ListenToByName>, "ListenToByName"}, // 18.0.0+
+-            {21, nullptr, "CreateToken"},
++            {21, C<&INpnsUser::CreateToken>, "CreateToken"},
+             {23, nullptr, "DestroyToken"},
+             {25, nullptr, "QueryIsTokenValid"},
+-            {26, nullptr, "ListenToMyApplicationId"},
++            {26, C<&INpnsUser::ListenToMyApplicationId>, "ListenToMyApplicationId"},
+             {101, nullptr, "Suspend"},
+             {102, nullptr, "Resume"},
+-            {103, nullptr, "GetState"},
++            {103, C<&INpnsUser::GetState>, "GetState"},
+             {104, nullptr, "GetStatistics"},
+             {111, nullptr, "GetJid"},
+             {120, nullptr, "CreateNotificationReceiver"},
+@@ -195,6 +200,24 @@ private:
+         R_SUCCEED();
+     }
+ 
++    // Nextendo port (from citron-nextendo, GPL-3.0): ACNH calls these when going online. They were
++    // nullptr, which makes the game panic (2010-0212). Plain success stubs, as in citron-nextendo.
++    Result ListenToMyApplicationId() {
++        LOG_WARNING(Service_NPNS, "(STUBBED) called");
++        R_SUCCEED();
++    }
++
++    Result CreateToken() {
++        LOG_WARNING(Service_NPNS, "(STUBBED) called");
++        R_SUCCEED();
++    }
++
++    Result GetState(Out<u32> out_state) {
++        LOG_DEBUG(Service_NPNS, "(STUBBED) called");
++        *out_state = 0;
++        R_SUCCEED();
++    }
++
+     KernelHelpers::ServiceContext service_context;
+     Event get_receive_event;
+ };
+-- 
+2.43.0
+
