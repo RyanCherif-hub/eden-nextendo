@@ -1,0 +1,80 @@
+From 9af77cceaf1954ca8859ef56d571c66d0e92ad87 Mon Sep 17 00:00:00 2001
+From: RyanCherif-hub <noreply@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 19:37:45 +0100
+Subject: [PATCH] build: include fmt/format.h next to fmt/core.h
+
+Newer fmt (MSYS2) no longer pulls fmt::format in through fmt/core.h.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WPxeWxr692dY99HZxM8fWB
+---
+ src/common/settings.cpp                  | 1 +
+ src/common/settings_setting.h            | 1 +
+ src/common/time_zone.cpp                 | 1 +
+ src/yuzu/configuration/shared_widget.cpp | 1 +
+ src/yuzu/startup_checks.cpp              | 1 +
+ 5 files changed, 5 insertions(+)
+
+diff --git a/src/common/settings.cpp b/src/common/settings.cpp
+index 54848c4..b8138a6 100644
+--- a/src/common/settings.cpp
++++ b/src/common/settings.cpp
+@@ -18,6 +18,7 @@
+ #include <type_traits>
+ #include <deque>
+ #include <fmt/core.h>
++#include <fmt/format.h>
+ 
+ #include "common/settings_enums.h"
+ #include "common/assert.h"
+diff --git a/src/common/settings_setting.h b/src/common/settings_setting.h
+index 076acee..91ba7a2 100644
+--- a/src/common/settings_setting.h
++++ b/src/common/settings_setting.h
+@@ -14,6 +14,7 @@
+ #include <typeindex>
+ #include <typeinfo>
+ #include <fmt/core.h>
++#include <fmt/format.h>
+ #include "common/common_types.h"
+ #include "common/settings_common.h"
+ #include "common/settings_enums.h"
+diff --git a/src/common/time_zone.cpp b/src/common/time_zone.cpp
+index 64f2925..84f0214 100644
+--- a/src/common/time_zone.cpp
++++ b/src/common/time_zone.cpp
+@@ -12,6 +12,7 @@
+ #include <stdexcept>
+ #include <fmt/chrono.h>
+ #include <fmt/core.h>
++#include <fmt/format.h>
+ 
+ #include "common/logging.h"
+ #include "common/time_zone.h"
+diff --git a/src/yuzu/configuration/shared_widget.cpp b/src/yuzu/configuration/shared_widget.cpp
+index ce11763..f66fdc5 100644
+--- a/src/yuzu/configuration/shared_widget.cpp
++++ b/src/yuzu/configuration/shared_widget.cpp
+@@ -37,6 +37,7 @@
+ #include <QtCore/qglobal.h>
+ #include <QtCore/qobjectdefs.h>
+ #include <fmt/core.h>
++#include <fmt/format.h>
+ #include <qglobal.h>
+ #include <qnamespace.h>
+ 
+diff --git a/src/yuzu/startup_checks.cpp b/src/yuzu/startup_checks.cpp
+index f54992d..bcd053f 100644
+--- a/src/yuzu/startup_checks.cpp
++++ b/src/yuzu/startup_checks.cpp
+@@ -21,6 +21,7 @@
+ #endif
+ 
+ #include <fmt/core.h>
++#include <fmt/format.h>
+ #include "video_core/vulkan_common/vulkan_instance.h"
+ #include "video_core/vulkan_common/vulkan_library.h"
+ #include "yuzu/startup_checks.h"
+-- 
+2.43.0
+
