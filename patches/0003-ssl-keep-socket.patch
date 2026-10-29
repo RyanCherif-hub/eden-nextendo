@@ -1,0 +1,51 @@
+From 2ca06c671afc46f4d59579be0bfedfb90b0c8ab7 Mon Sep 17 00:00:00 2001
+From: RyanCherif-hub <noreply@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 17:24:55 +0100
+Subject: [PATCH] ssl: keep the connection's socket after SetSocketDescriptor
+
+SetSocketDescriptor moved the socket into the backend and left the
+connection's own pointer empty, so SetIoMode returned ResultNoSocket and
+games gave up before the handshake (ACNH 2219-1035). Also fix
+Set/GetNextAlpnProto copying the wrong way.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WPxeWxr692dY99HZxM8fWB
+---
+ src/core/hle/service/ssl/ssl.cpp | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/src/core/hle/service/ssl/ssl.cpp b/src/core/hle/service/ssl/ssl.cpp
+index 1d602ff..bd88618 100644
+--- a/src/core/hle/service/ssl/ssl.cpp
++++ b/src/core/hle/service/ssl/ssl.cpp
+@@ -202,7 +202,8 @@ private:
+                 return ResultInvalidSocket;
+             }
+             socket = std::move(*sock);
+-            backend->SetSocket(std::move(socket));
++            // Keep our own reference: SetIoMode, GetSocketDescriptor and DoHandshake all need it.
++            backend->SetSocket(socket);
+             return ResultSuccess;
+         }
+         LOG_ERROR(Service_SSL, "Failed to duplicate socket with fd {}", in_fd);
+@@ -414,15 +415,14 @@ private:
+     }
+ 
+     Result SetNextAlpnProto(InBuffer<BufferAttr_HipcMapAlias> data) {
+-        auto const to_write = u32((std::min)(next_alpn_proto.size(), data.size()));
+-        next_alpn_proto.assign(data.begin(), data.begin() + to_write);
++        next_alpn_proto.assign(data.begin(), data.end());
+         LOG_DEBUG(Service_SSL, "SetNextAlpnProto called, size={}", next_alpn_proto.size());
+         R_SUCCEED();
+     }
+ 
+     Result GetNextAlpnProto(OutBuffer<BufferAttr_HipcMapAlias> data, Out<u32> to_write) {
+         *to_write = u32((std::min)(next_alpn_proto.size(), data.size()));
+-        next_alpn_proto.assign(data.begin(), data.begin() + *to_write);
++        std::copy_n(next_alpn_proto.begin(), *to_write, data.begin());
+         LOG_DEBUG(Service_SSL, "GetNextAlpnProto called, size={}", *to_write);
+         R_SUCCEED();
+     }
+-- 
+2.43.0
+
