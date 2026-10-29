@@ -70,7 +70,7 @@ jobs:
             enet:p opus:p mbedtls:p libusb:p unordered_dense:p
             jbigkit:p xz:p libdeflate:p bzip2:p lerc:p graphite2:p crt-git:p
             libwebp:p libtiff:p brotli:p
-            ffmpeg:p sdl2:p qt6-base:p
+            ffmpeg:p qt6-base:p
 
       - name: Configure
         shell: msys2 {0}
@@ -78,7 +78,7 @@ jobs:
           cd eden
           ./.ci/common/configure.sh -DUSE_CCACHE=OFF -DENABLE_UPDATE_CHECKER=OFF -DYUZU_CMD=OFF \
             -DYUZU_STATIC_BUILD=OFF -DYUZU_USE_BUNDLED_OPENSSL=OFF -DYUZU_USE_BUNDLED_FFMPEG=OFF \
-            -DYUZU_USE_BUNDLED_QT=OFF -DYUZU_USE_BUNDLED_SDL2=OFF
+            -DYUZU_USE_BUNDLED_QT=OFF -DYUZU_USE_BUNDLED_SDL2=OFF -DYUZU_USE_EXTERNAL_SDL2=ON
 
       - name: Build
         shell: msys2 {0}
