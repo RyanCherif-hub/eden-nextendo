@@ -36,6 +36,12 @@ jobs:
           git -C ci checkout -q "$CI_COMMIT"
           rm -rf eden/.ci
           cp -r ci/.ci eden/.ci
+          # The 0.2.0-era CI built static against MINGW64-only bundles (OpenSSL, Qt, FFmpeg);
+          # MINGW64 lost packages since, so build dynamic against UCRT64 system libraries.
+          sed -i -e 's/^\t\tSTATIC=ON/\t\tSTATIC=OFF/' -e 's/^\t\tQT=ON/\t\tQT=OFF/' \
+                 -e 's/^\t\tOPENSSL=ON/\t\tOPENSSL=OFF/' -e 's/^\t\tFFMPEG=ON/\t\tFFMPEG=OFF/' \
+                 eden/.ci/common/platform.sh
+          grep -n -A8 'MSYS\*)' eden/.ci/common/platform.sh
 
       - name: Apply fix
         shell: bash
@@ -64,12 +70,15 @@ jobs:
             enet:p opus:p mbedtls:p libusb:p unordered_dense:p
             jbigkit:p xz:p libdeflate:p bzip2:p lerc:p graphite2:p crt-git:p
             libwebp:p libtiff:p brotli:p
+            ffmpeg:p sdl2:p qt6-base:p
 
       - name: Configure
         shell: msys2 {0}
         run: |
           cd eden
-          ./.ci/common/configure.sh -DUSE_CCACHE=OFF -DENABLE_UPDATE_CHECKER=OFF
+          ./.ci/common/configure.sh -DUSE_CCACHE=OFF -DENABLE_UPDATE_CHECKER=OFF -DYUZU_CMD=OFF \
+            -DYUZU_STATIC_BUILD=OFF -DYUZU_USE_BUNDLED_OPENSSL=OFF -DYUZU_USE_BUNDLED_FFMPEG=OFF \
+            -DYUZU_USE_BUNDLED_QT=OFF -DYUZU_USE_BUNDLED_SDL2=OFF
 
       - name: Build
         shell: msys2 {0}
