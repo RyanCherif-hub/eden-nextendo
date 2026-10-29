@@ -1,0 +1,170 @@
+From 0f9bba704f46c562f1f3cba7af042452ffaf0474 Mon Sep 17 00:00:00 2001
+From: RyanCherif-hub <noreply@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 19:24:38 +0100
+Subject: [PATCH] vulkan: don't abort when a compute pipeline fails to build
+
+On Eden 0.2.0 an exception thrown while building a compute pipeline (the
+driver rejecting it) escaped the shader worker thread and killed the
+emulator (0xc0000409 in ucrtbase / 0x40000015). Seen on Intel UHD when
+entering the airport in Animal Crossing: New Horizons. Catch it, log it,
+and skip dispatches for that shader, like newer Eden does.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WPxeWxr692dY99HZxM8fWB
+---
+ .../renderer_vulkan/vk_compute_pipeline.cpp   | 19 ++++++++++++++++++-
+ .../renderer_vulkan/vk_compute_pipeline.h     |  9 ++++++++-
+ .../renderer_vulkan/vk_pipeline_cache.cpp     |  4 ++++
+ .../renderer_vulkan/vk_rasterizer.cpp         | 17 ++++++++++++++---
+ 4 files changed, 44 insertions(+), 5 deletions(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+index 490dd7a..94c9468 100644
+--- a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+@@ -47,6 +47,10 @@ ComputePipeline::ComputePipeline(const Device& device_, vk::PipelineCache& pipel
+                 uniform_buffer_sizes.begin());
+ 
+     auto func{[this, &descriptor_pool, shader_notify, pipeline_statistics] {
++        // Fix for 0.2.0: an exception here (driver rejecting the pipeline) used to escape the
++        // shader worker thread and abort the whole emulator (0xc0000409 / 0x40000015, seen on
++        // Intel UHD in Animal Crossing's airport). Skip the shader instead, like newer Eden does.
++        try {
+         DescriptorLayoutBuilder builder{device};
+         builder.Add(info, VK_SHADER_STAGE_COMPUTE_BIT);
+ 
+@@ -96,6 +100,12 @@ ComputePipeline::ComputePipeline(const Device& device_, vk::PipelineCache& pipel
+         if (pipeline_statistics) {
+             pipeline_statistics->Collect(*pipeline);
+         }
++        } catch (const std::exception& exception) {
++            LOG_CRITICAL(Render_Vulkan, "Compute pipeline build failed, skipping shader: {}",
++                         exception.what());
++            pipeline.reset();
++            build_failed.store(true, std::memory_order::relaxed);
++        }
+         std::scoped_lock lock{build_mutex};
+         is_built = true;
+         build_condvar.notify_one();
+@@ -110,9 +120,12 @@ ComputePipeline::ComputePipeline(const Device& device_, vk::PipelineCache& pipel
+     }
+ }
+ 
+-void ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
++bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
+                                 Tegra::MemoryManager& gpu_memory, Scheduler& scheduler,
+                                 BufferCache& buffer_cache, TextureCache& texture_cache) {
++    if (build_failed.load(std::memory_order::relaxed)) {
++        return false;
++    }
+     guest_descriptor_queue.Acquire();
+ 
+     buffer_cache.SetComputeUniformBufferState(info.constant_buffer_mask, &uniform_buffer_sizes);
+@@ -232,6 +245,9 @@ void ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
+     const bool is_rescaling = !info.texture_descriptors.empty() || !info.image_descriptors.empty();
+     scheduler.Record([this, descriptor_data, is_rescaling,
+                       rescaling_data = rescaling.Data()](vk::CommandBuffer cmdbuf) {
++        if (!pipeline) {
++            return;
++        }
+         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
+         if (!descriptor_set_layout) {
+             return;
+@@ -252,6 +268,7 @@ void ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
+                                       descriptor_set, nullptr);
+         }
+     });
++    return true;
+ }
+ 
+ } // namespace Vulkan
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.h b/src/video_core/renderer_vulkan/vk_compute_pipeline.h
+index aa84c00..14ec572 100644
+--- a/src/video_core/renderer_vulkan/vk_compute_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.h
+@@ -45,9 +45,15 @@ public:
+     ComputePipeline& operator=(const ComputePipeline&) = delete;
+     ComputePipeline(const ComputePipeline&) = delete;
+ 
+-    void Configure(Tegra::Engines::KeplerCompute& kepler_compute, Tegra::MemoryManager& gpu_memory,
++    /// Returns false when the shader could not be built and the dispatch must be skipped.
++    bool Configure(Tegra::Engines::KeplerCompute& kepler_compute, Tegra::MemoryManager& gpu_memory,
+                    Scheduler& scheduler, BufferCache& buffer_cache, TextureCache& texture_cache);
+ 
++    /// True once the build finished with a usable pipeline. Valid on the scheduler thread.
++    [[nodiscard]] bool HasPipeline() const noexcept {
++        return static_cast<bool>(pipeline);
++    }
++
+ private:
+     const Device& device;
+     vk::PipelineCache& pipeline_cache;
+@@ -67,6 +73,7 @@ private:
+     std::condition_variable build_condvar;
+     std::mutex build_mutex;
+     std::atomic_bool is_built{false};
++    std::atomic_bool build_failed{false};
+ };
+ 
+ } // namespace Vulkan
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index d0f9809..17f9cb1 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -923,6 +923,10 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
+ } catch (const Shader::Exception& exception) {
+     LOG_ERROR(Render_Vulkan, "{}", exception.what());
+     return nullptr;
++} catch (const std::exception& exception) {
++    // Fix for 0.2.0: e.g. vk::Exception from BuildShader used to abort the emulator.
++    LOG_CRITICAL(Render_Vulkan, "Compute shader build failed, skipping it: {}", exception.what());
++    return nullptr;
+ }
+ 
+ void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& filename,
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 3c3367c..b7c7838 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -555,7 +555,10 @@ void RasterizerVulkan::DispatchCompute() {
+         return;
+     }
+     std::scoped_lock lock{texture_cache.mutex, buffer_cache.mutex};
+-    pipeline->Configure(*kepler_compute, *gpu_memory, scheduler, buffer_cache, texture_cache);
++    if (!pipeline->Configure(*kepler_compute, *gpu_memory, scheduler, buffer_cache,
++                             texture_cache)) {
++        return;
++    }
+ 
+     const auto& qmd{kepler_compute->launch_description};
+     auto indirect_address = kepler_compute->GetIndirectComputeAddress();
+@@ -566,8 +569,11 @@ void RasterizerVulkan::DispatchCompute() {
+         const auto [buffer, offset] =
+             buffer_cache.ObtainBuffer(*indirect_address, 12, sync_info, post_op);
+         scheduler.RequestOutsideRenderPassOperationContext();
+-        scheduler.Record([indirect_buffer = buffer->Handle(),
++        scheduler.Record([pipeline, indirect_buffer = buffer->Handle(),
+                           indirect_offset = offset](vk::CommandBuffer cmdbuf) {
++            if (!pipeline->HasPipeline()) {
++                return;
++            }
+             cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);
+         });
+         return;
+@@ -582,7 +588,12 @@ void RasterizerVulkan::DispatchCompute() {
+     };
+     scheduler.Record([](vk::CommandBuffer cmdbuf) { cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                0, READ_BARRIER); });
+-    scheduler.Record([dim](vk::CommandBuffer cmdbuf) { cmdbuf.Dispatch(dim[0], dim[1], dim[2]); });
++    scheduler.Record([pipeline, dim](vk::CommandBuffer cmdbuf) {
++        if (!pipeline->HasPipeline()) {
++            return;
++        }
++        cmdbuf.Dispatch(dim[0], dim[1], dim[2]);
++    });
+ 
+     // Log compute dispatch
+     if (Settings::values.gpu_logging_enabled.GetValue() &&
+-- 
+2.43.0
+
