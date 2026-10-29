@@ -51,7 +51,7 @@ jobs:
       - name: Setup MSYS2
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: UCRT64
           update: true
           install: >-
             git make autoconf libtool automake-wrapper patch jq
@@ -80,7 +80,7 @@ jobs:
       - name: Package
         shell: msys2 {0}
         env:
-          MSYS_TOOLCHAIN: MINGW64
+          MSYS_TOOLCHAIN: UCRT64
           ARTIFACT_REF: v0.2.0-airportfix
         run: |
           cd eden
